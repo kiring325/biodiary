@@ -160,6 +160,8 @@ def initialize_database() -> None:
             ("avatar_mime", "TEXT NOT NULL DEFAULT ''"),
             ("avatar_updated_at", "INTEGER NOT NULL DEFAULT 0"),
             ("community_joined", "INTEGER NOT NULL DEFAULT 1"),
+            # どのコミュニティに属するか。複数コミュニティ化より前のアカウントは 'default'。
+            ("community_id", "TEXT NOT NULL DEFAULT 'default'"),
         ):
             if name not in account_columns:
                 connection.execute(f"ALTER TABLE accounts ADD COLUMN {name} {definition}")
@@ -276,25 +278,56 @@ def trusted_cloudflare_account() -> sqlite3.Row | None:
             or not isinstance(registered_at, int)
             or not isinstance(claims.get("communityMember"), bool)):
         return None
+    # 旧版のWorkerは communityId を送らないので、その場合は 'default' とみなす
+    community_id = claims.get("communityId", "default" if claims["communityMember"] else "")
+    if not isinstance(community_id, str) or not re.fullmatch(r"[a-z0-9-]{0,32}", community_id):
+        return None
+    if claims["communityMember"] and not community_id:
+        return None
     connection = get_db()
     row = connection.execute("SELECT * FROM accounts WHERE account_code = ?", (account_code,)).fetchone()
     try:
         if row is None:
             connection.execute(
                 """INSERT INTO accounts(id, account_code, login_name, password_hash, display_name, message,
-                   registered_at, community_joined) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   registered_at, community_joined, community_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (str(uuid.uuid4()), account_code, login_name,
                  generate_password_hash(secrets.token_urlsafe(32), method="scrypt"), display_name, message,
-                 registered_at, int(claims["communityMember"])),
+                 registered_at, int(claims["communityMember"]), community_id or "default"),
             )
+        elif claims["communityMember"]:
+            connection.execute(
+                "UPDATE accounts SET display_name = ?, message = ?, community_joined = 1, community_id = ? WHERE account_code = ?",
+                (display_name, message, community_id, account_code))
         else:
-            connection.execute("UPDATE accounts SET display_name = ?, message = ?, community_joined = ? WHERE account_code = ?",
-                               (display_name, message, int(claims["communityMember"]), account_code))
+            # 未参加になった場合も community_id は残す（過去の共有記録が元のコミュニティに残るように）
+            connection.execute("UPDATE accounts SET display_name = ?, message = ?, community_joined = 0 WHERE account_code = ?",
+                               (display_name, message, account_code))
         connection.commit()
     except sqlite3.IntegrityError:
         connection.rollback()
         return None
     return connection.execute("SELECT * FROM accounts WHERE account_code = ?", (account_code,)).fetchone()
+
+
+def my_community() -> str:
+    return g.account["community_id"] or "default"
+
+
+def shared_in_my_community(alias: str = "") -> str:
+    """「同じコミュニティの人が共有した記録」を表すSQLの条件。値として my_community() を1つ渡す。"""
+    prefix = alias + "." if alias else ""
+    return f"({prefix}shared = 1 AND {prefix}owner_id IN (SELECT id FROM accounts WHERE community_id = ?))"
+
+
+def visible_to_me(row: sqlite3.Row) -> bool:
+    """自分の記録か、同じコミュニティの人が共有した記録なら見られる。"""
+    if row["owner_id"] == g.account["id"]:
+        return True
+    if not row["shared"]:
+        return False
+    owner = get_db().execute("SELECT community_id FROM accounts WHERE id = ?", (row["owner_id"],)).fetchone()
+    return bool(owner and owner["community_id"] == my_community())
 
 
 def signed_request_allowed(account: sqlite3.Row) -> bool:
@@ -312,8 +345,9 @@ def signed_request_allowed(account: sqlite3.Row) -> bool:
         return True
     target = re.fullmatch(r"/api/v1/community/members/(BD-[A-F0-9]{8,12})/avatar", path)
     if target and method == "GET":
-        member = get_db().execute("SELECT community_joined FROM accounts WHERE account_code = ?", (target[1],)).fetchone()
-        return bool(member and member["community_joined"])
+        member = get_db().execute("SELECT community_joined, community_id FROM accounts WHERE account_code = ?",
+                                  (target[1],)).fetchone()
+        return bool(member and member["community_joined"] and member["community_id"] == (account["community_id"] or "default"))
     if path == "/api/v1/tag-groups":
         return method in ("GET", "PUT")
     if path == "/api/v1/observations":
@@ -771,7 +805,8 @@ def update_avatar():
 @app.get("/api/v1/community/members")
 @require_account
 def community_members():
-    rows = get_db().execute("SELECT * FROM accounts WHERE community_joined = 1 ORDER BY registered_at, login_name").fetchall()
+    rows = get_db().execute("SELECT * FROM accounts WHERE community_joined = 1 AND community_id = ? ORDER BY registered_at, login_name",
+                            (my_community(),)).fetchall()
     return jsonify(members=[account_json(row) for row in rows])
 
 
@@ -831,21 +866,22 @@ def observations():
         server_time = int(time.time())
         if "since" in request.args:
             rows = connection.execute(
-                """SELECT * FROM observations WHERE (owner_id = ? OR shared = 1) AND updated_at >= ?
+                """SELECT * FROM observations WHERE (owner_id = ? OR """ + shared_in_my_community() + """) AND updated_at >= ?
                    ORDER BY updated_at ASC, id ASC LIMIT ? OFFSET ?""",
-                (g.account["id"], since, limit, offset),
+                (g.account["id"], my_community(), since, limit, offset),
             ).fetchall()
         else:
             rows = connection.execute(
-                """SELECT * FROM observations WHERE owner_id = ? OR shared = 1
+                """SELECT * FROM observations WHERE owner_id = ? OR """ + shared_in_my_community() + """
                    ORDER BY updated_at DESC LIMIT ? OFFSET ?""",
-                (g.account["id"], limit, offset),
+                (g.account["id"], my_community(), limit, offset),
             ).fetchall()
         result = {"observations": [observation_json(connection, row) for row in rows],
                   "serverTime": server_time}
         if offset == 0:
             result["visibleIds"] = [row["id"] for row in connection.execute(
-                "SELECT id FROM observations WHERE owner_id = ? OR shared = 1", (g.account["id"],))]
+                "SELECT id FROM observations WHERE owner_id = ? OR " + shared_in_my_community(),
+                (g.account["id"], my_community()))]
         return jsonify(result)
 
     payload, upload = request_payload()
@@ -880,7 +916,7 @@ def observations():
 def observation_detail(observation_id: str):
     connection = get_db()
     row = connection.execute("SELECT * FROM observations WHERE id = ?", (observation_id,)).fetchone()
-    if row is None or (row["owner_id"] != g.account["id"] and not row["shared"]):
+    if row is None or not visible_to_me(row):
         return json_error("観察記録が見つかりません", 404)
     if request.method == "GET":
         return jsonify(observation=observation_json(connection, row))
@@ -939,7 +975,8 @@ def observation_detail(observation_id: str):
 def shared_comment_observation(observation_id: str):
     if not g.account["community_joined"]:
         abort(403)
-    row = get_db().execute("SELECT * FROM observations WHERE id = ? AND shared = 1", (observation_id,)).fetchone()
+    row = get_db().execute("SELECT * FROM observations WHERE id = ? AND " + shared_in_my_community(),
+                           (observation_id, my_community())).fetchone()
     if row is None:
         abort(404)
     return row
@@ -964,8 +1001,8 @@ def add_notification(connection, recipient_id, observation_id, kind, event_key, 
 def notification_counts(connection):
     row = connection.execute("""SELECT COUNT(CASE WHEN n.read_at IS NULL THEN 1 END) AS unread,
         COALESCE(MAX(n.id), 0) AS newest FROM notifications n
-        JOIN observations o ON o.id = n.observation_id WHERE n.recipient_id = ? AND o.shared = 1""",
-        (g.account["id"],)).fetchone()
+        JOIN observations o ON o.id = n.observation_id WHERE n.recipient_id = ? AND """ + shared_in_my_community("o"),
+        (g.account["id"], my_community())).fetchone()
     return {"unreadCount": row["unread"], "newestId": row["newest"]}
 
 
@@ -983,11 +1020,11 @@ def list_notifications():
         return json_error("ページ指定が正しくありません", 400)
     connection = get_db()
     clause = " AND n.id < ?" if before is not None else ""
-    params = [g.account["id"]] + ([before] if before is not None else []) + [limit + 1]
+    params = [g.account["id"], my_community()] + ([before] if before is not None else []) + [limit + 1]
     rows = connection.execute("""SELECT n.*, o.data_json, c.body, c.deleted_at FROM notifications n
         JOIN observations o ON o.id = n.observation_id
         LEFT JOIN observation_comments c ON c.id = n.comment_id
-        WHERE n.recipient_id = ? AND o.shared = 1""" + clause + " ORDER BY n.id DESC LIMIT ?", params).fetchall()
+        WHERE n.recipient_id = ? AND """ + shared_in_my_community("o") + clause + " ORDER BY n.id DESC LIMIT ?", params).fetchall()
     page = rows[:limit]
     items = []
     for row in page:
@@ -1016,8 +1053,8 @@ def read_notifications():
         if type(through) is not int or through < 0:
             return json_error("通知の指定が正しくありません", 400)
         connection.execute("""UPDATE notifications SET read_at = ? WHERE recipient_id = ? AND id <= ?
-            AND read_at IS NULL AND observation_id IN (SELECT id FROM observations WHERE shared = 1)""",
-            (now, g.account["id"], through))
+            AND read_at IS NULL AND observation_id IN (SELECT id FROM observations WHERE """ + shared_in_my_community() + ")",
+            (now, g.account["id"], through, my_community()))
     else:
         ids = payload.get("ids")
         if not isinstance(ids, list) or not 1 <= len(ids) <= 100 or any(type(i) is not int or i < 1 for i in ids):
@@ -1122,10 +1159,11 @@ def member_observations(account_code: str):
     except ValueError:
         return json_error("ページ指定が正しくありません", 400)
     connection = get_db()
-    query = "FROM observations o JOIN accounts a ON a.id = o.owner_id WHERE a.account_code = ? AND o.shared = 1"
-    total = connection.execute("SELECT COUNT(*) " + query, (account_code,)).fetchone()[0]
+    query = ("FROM observations o JOIN accounts a ON a.id = o.owner_id WHERE a.account_code = ? AND o.shared = 1"
+             " AND a.community_id = ?")
+    total = connection.execute("SELECT COUNT(*) " + query, (account_code, my_community())).fetchone()[0]
     rows = connection.execute("SELECT o.* " + query + " ORDER BY o.created_at DESC, o.id DESC LIMIT ? OFFSET ?",
-                              (account_code, limit, offset)).fetchall()
+                              (account_code, my_community(), limit, offset)).fetchall()
     return jsonify(observations=[observation_json(connection, row) for row in rows], total=total,
                    hasMore=offset + len(rows) < total, nextOffset=offset + len(rows))
 
@@ -1137,8 +1175,8 @@ def reaction_summary():
         abort(403)
     rows = get_db().execute("""SELECT o.id, o.created_at, COUNT(l.account_id) AS count,
         COALESCE(MAX(l.account_id = ?), 0) AS liked FROM observations o
-        LEFT JOIN observation_likes l ON l.observation_id = o.id WHERE o.shared = 1
-        GROUP BY o.id""", (g.account["id"],)).fetchall()
+        LEFT JOIN observation_likes l ON l.observation_id = o.id WHERE """ + shared_in_my_community("o") + """
+        GROUP BY o.id""", (g.account["id"], my_community())).fetchall()
     return jsonify(reactions=[{"id": row["id"], "likeCount": row["count"], "likedByMe": bool(row["liked"]),
                                "createdAt": row["created_at"] * 1000} for row in rows])
 
@@ -1170,7 +1208,7 @@ def observation_likes(observation_id: str):
 @require_account
 def observation_photo(observation_id: str, photo_index: int = 1):
     row = get_db().execute("SELECT * FROM observations WHERE id = ?", (observation_id,)).fetchone()
-    if row is None or (row["owner_id"] != g.account["id"] and not row["shared"]):
+    if row is None or not visible_to_me(row):
         abort(404)
     photos = row_photos(row)
     if not 1 <= photo_index <= len(photos):

@@ -43,6 +43,12 @@ function constantTimeEqual(left, right) {
   return mismatch === 0;
 }
 
+// 参加しているコミュニティのID。未参加なら空文字。移行前の行（community_id が空）は 'default' とみなす。
+function communityOf(row) {
+  if (!row?.community_joined) return '';
+  return row.community_id || 'default';
+}
+
 function accountJson(row) {
   return {
     accountId: row.account_code,
@@ -51,6 +57,7 @@ function accountJson(row) {
     message: row.message,
     registeredAt: row.registered_at,
     communityMember: Boolean(row.community_joined),
+    communityId: communityOf(row),
     guideSeenAt: row.onboarding_guide_seen_at || 0,
     avatarUrl: row.avatar_updated_at ? `/api/v1/community/members/${encodeURIComponent(row.account_code)}/avatar` : '',
     avatarUpdatedAt: row.avatar_updated_at,
@@ -125,11 +132,11 @@ async function tryLegacyLogin(env, loginName, password) {
   const existing = await env.DB.prepare('SELECT account_code FROM accounts WHERE login_name=?').bind(loginName).first();
   if (existing && existing.account_code !== legacy.accountId) return null;
   if (existing) {
-    await env.DB.prepare('UPDATE accounts SET password_salt=?, password_hash=?, community_joined=1 WHERE account_code=?')
+    await env.DB.prepare('UPDATE accounts SET password_salt=?, password_hash=?, community_joined=1, community_id=COALESCE(community_id, \'default\') WHERE account_code=?')
       .bind(salt, hash, legacy.accountId).run();
   } else {
     await env.DB.prepare(
-      'INSERT INTO accounts(account_code, login_name, display_name, message, password_salt, password_hash, registered_at, community_joined, avatar_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)'
+      'INSERT INTO accounts(account_code, login_name, display_name, message, password_salt, password_hash, registered_at, community_joined, community_id, avatar_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, \'default\', ?)'
     ).bind(legacy.accountId, loginName, legacy.displayName || loginName, legacy.message || '', salt, hash,
       Number(legacy.registeredAt) || Date.now(), Number(legacy.avatarUpdatedAt) || 0).run();
   }
@@ -168,19 +175,39 @@ async function joinCommunity(request, env, account) {
   const code = body?.inviteCode;
   if (typeof code !== 'string' || !code || code.length > 200) throw new ApiError(400, 'コミュニティの招待コードを入力してください');
   const now = nowSeconds(), codeHash = await sha256(code);
-  const count = await env.DB.prepare('SELECT COUNT(*) AS count FROM accounts WHERE community_joined=1').first();
-  if (count.count >= Number(env.MAX_COMMUNITY_MEMBERS || 10)) throw new ApiError(409, 'コミュニティの定員に達しています');
+  const limit = Number(env.MAX_COMMUNITY_MEMBERS || 10);
+  // 招待コードがどのコミュニティ用かを調べる
+  const invite = await env.DB.prepare(
+    'SELECT community_id FROM community_invites WHERE code_hash=? AND used_by IS NULL AND expires_at>?'
+  ).bind(codeHash, now).first();
+  if (!invite) throw new ApiError(400, '招待コードが無効か、有効期限が切れています');
+  const communityId = invite.community_id || 'default';
+  const community = await env.DB.prepare('SELECT 1 AS found FROM communities WHERE id=?').bind(communityId).first();
+  if (!community) throw new ApiError(400, '招待コードのコミュニティが見つかりません');
+  // 定員はコミュニティごとに数える
+  const count = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM accounts WHERE community_joined=1 AND COALESCE(community_id, 'default')=?"
+  ).bind(communityId).first();
+  if (count.count >= limit) throw new ApiError(409, 'コミュニティの定員に達しています');
   const updateInvite = await env.DB.prepare(
     'UPDATE community_invites SET used_by=? WHERE code_hash=? AND used_by IS NULL AND expires_at>?'
   ).bind(account.account_code, codeHash, now).run();
   if (!updateInvite.meta.changes) throw new ApiError(400, '招待コードが無効か、有効期限が切れています');
   const joined = await env.DB.prepare(
-    'UPDATE accounts SET community_joined=1 WHERE account_code=? AND community_joined=0 AND (SELECT COUNT(*) FROM accounts WHERE community_joined=1)<?'
-  ).bind(account.account_code, Number(env.MAX_COMMUNITY_MEMBERS || 10)).run();
+    "UPDATE accounts SET community_joined=1, community_id=? WHERE account_code=? AND community_joined=0 AND " +
+    "(SELECT COUNT(*) FROM accounts WHERE community_joined=1 AND COALESCE(community_id, 'default')=?)<?"
+  ).bind(communityId, account.account_code, communityId, limit).run();
   if (!joined.meta.changes) {
     await env.DB.prepare('UPDATE community_invites SET used_by=NULL WHERE code_hash=? AND used_by=?')
       .bind(codeHash, account.account_code).run();
     throw new ApiError(409, 'コミュニティの定員に達しています');
+  }
+  // 'default' 以外の新しいコミュニティでは、最初に参加した人を管理者にする（コミュニティ名を変更できる）
+  if (communityId !== 'default') {
+    await env.DB.prepare(
+      'INSERT OR IGNORE INTO community_admins(community_id, account_code) ' +
+      'SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM community_admins WHERE community_id=?)'
+    ).bind(communityId, account.account_code, communityId).run();
   }
   const updated = await env.DB.prepare('SELECT * FROM accounts WHERE account_code=?').bind(account.account_code).first();
   return reply({ account: accountJson(updated) });
@@ -190,7 +217,8 @@ async function signIdentity(env, account) {
   const claims = {
     accountId: account.account_code, loginName: account.login_name, displayName: account.display_name,
     message: account.message, registeredAt: account.registered_at,
-    communityMember: Boolean(account.community_joined), expiresAt: nowSeconds() + 60,
+    communityMember: Boolean(account.community_joined), communityId: communityOf(account),
+    expiresAt: nowSeconds() + 60,
   };
   const payload = base64url(encoder.encode(JSON.stringify(claims)));
   const key = await crypto.subtle.importKey('raw', encoder.encode(env.PI_SHARED_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
@@ -200,7 +228,7 @@ async function signIdentity(env, account) {
 
 async function communitySettings(request, env, account) {
   if (!account.community_joined) throw new ApiError(403, 'コミュニティへの参加が必要です');
-  const id = 'default';
+  const id = communityOf(account);
   const admin = await env.DB.prepare('SELECT 1 AS allowed FROM community_admins WHERE community_id=? AND account_code=?')
     .bind(id, account.account_code).first();
   if (request.method === 'PATCH') {
@@ -290,14 +318,17 @@ async function handle(request, env) {
   }
   if (path === '/api/v1/community/members' && request.method === 'GET') {
     if (!account.community_joined) throw new ApiError(403, 'コミュニティへの参加が必要です');
-    const rows = await env.DB.prepare('SELECT * FROM accounts WHERE community_joined=1 ORDER BY registered_at, login_name').all();
+    const rows = await env.DB.prepare(
+      "SELECT * FROM accounts WHERE community_joined=1 AND COALESCE(community_id, 'default')=? ORDER BY registered_at, login_name"
+    ).bind(communityOf(account)).all();
     return reply({ members: rows.results.map(accountJson) });
   }
   const memberMatch = /^\/api\/v1\/community\/members\/(BD-[A-F0-9]{8,12})$/.exec(path);
   if (memberMatch && request.method === 'GET') {
     if (!account.community_joined) throw new ApiError(403, 'コミュニティへの参加が必要です');
-    const member = await env.DB.prepare('SELECT * FROM accounts WHERE account_code=? AND community_joined=1')
-      .bind(memberMatch[1]).first();
+    const member = await env.DB.prepare(
+      "SELECT * FROM accounts WHERE account_code=? AND community_joined=1 AND COALESCE(community_id, 'default')=?"
+    ).bind(memberMatch[1], communityOf(account)).first();
     if (!member) throw new ApiError(404, 'メンバーが見つかりません');
     return reply({ member: accountJson(member) });
   }
@@ -305,9 +336,9 @@ async function handle(request, env) {
   if (avatarMatch && request.method === 'GET') {
     if (avatarMatch[1] !== account.account_code) {
       if (!account.community_joined) throw new ApiError(403, 'コミュニティへの参加が必要です');
-      const owner = await env.DB.prepare('SELECT community_joined FROM accounts WHERE account_code=?')
+      const owner = await env.DB.prepare('SELECT community_joined, community_id FROM accounts WHERE account_code=?')
         .bind(avatarMatch[1]).first();
-      if (!owner?.community_joined) throw new ApiError(404, '見つかりません');
+      if (!owner?.community_joined || communityOf(owner) !== communityOf(account)) throw new ApiError(404, '見つかりません');
     }
     return proxyToPi(request, env, account);
   }

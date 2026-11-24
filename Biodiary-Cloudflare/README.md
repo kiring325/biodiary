@@ -61,7 +61,32 @@ ver0.1.2向けです。アカウント、ログイン状態、コミュニティ
 node scripts/new-invite.mjs 5
 ```
 
-発行数は1〜60を指定でき、省略すると1件です。表示された1つのSQLをCloudflare D1 Consoleに貼り付けるか、`npx wrangler d1 execute biodiary-accounts --remote --file=招待コード用.sql` で登録します。その後、招待コードを1人に1つずつ伝えます。コードは14日間有効で1回だけ使えます。コミュニティの上限は `wrangler.toml` の `MAX_COMMUNITY_MEMBERS` で変更できます。アカウントの上限は別の `MAX_ACCOUNTS` です。
+発行数は1〜60を指定でき、省略すると1件です。表示された1つのSQLをCloudflare D1 Consoleに貼り付けるか、`npx wrangler d1 execute biodiary-accounts --remote --file=招待コード用.sql` で登録します。その後、招待コードを1人に1つずつ伝えます。コードは14日間有効で1回だけ使えます。コミュニティの上限（コミュニティごとの人数）は `wrangler.toml` の `MAX_COMMUNITY_MEMBERS` で変更できます。アカウントの上限は別の `MAX_ACCOUNTS` です。
+
+### 別のコミュニティを作る（面接・見学用など）
+
+いつものコミュニティ（ID `default`）とは別に、投稿・メンバー・いいね・コメント・通知が混ざらないコミュニティを作れます。招待コードを発行するときにコミュニティIDと名前を指定します。
+
+```sh
+node scripts/new-invite.mjs 3 --community interview --name "面接用コミュニティ"
+```
+
+- 表示されたSQL（コミュニティの作成と招待コードの登録）をCloudflare D1 Consoleでそのまま実行します。同じIDで2回目以降に発行しても、コミュニティは作り直されません。
+- このコードで参加した人は、そのコミュニティのメンバー・共有記録だけを見られます。いつものコミュニティの人からも、面接用の投稿は見えません。
+- 最初に参加した人がそのコミュニティの管理者になり、アカウント画面からコミュニティ名を変更できます。
+- 1つのアカウントが参加できるコミュニティは1つだけです。自分も面接用コミュニティの中を見せたい場合は、面接用に別のアカウントを作って参加します。
+- コミュニティの一覧は D1 Console で `SELECT * FROM communities;`、メンバーは `SELECT login_name, community_id FROM accounts WHERE community_joined=1;` で確認できます。
+
+### 複数コミュニティ対応を本番に反映する手順（ver0.1.3 → 複数コミュニティ）
+
+順番が大切です。**Pi を先に更新**してください（古いPiのまま新しいWorkerを公開すると、面接用コミュニティの人にもいつもの共有記録が見えてしまいます）。
+
+1. Pi の `biodiary.sqlite3` をバックアップし、新しい `biodiary_api.py` を配置して `sudo systemctl restart biodiary-api` で再起動する。起動時に `community_id` 列が自動で追加され、既存のアカウントはすべて `default` になります。
+2. このフォルダで `npx wrangler d1 migrations apply biodiary-accounts --remote` を実行する（`0004_multiple_communities.sql` が適用され、参加済みの既存アカウントが `default` に入ります）。
+3. `npx wrangler deploy` でWorkerを公開する。
+4. 上の `new-invite.mjs --community ...` で招待コードを作って登録する。
+
+Android版・ブラウザ版のアプリは変更不要です（コミュニティ名・管理者表示は既存の画面がそのまま使えます）。
 
 ## 無料枠と注意点
 

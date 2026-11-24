@@ -26,3 +26,4 @@
 # Keep the current APK inside MoriNote-Web because the site links to it.
 /Biodiary-*.apk
 /MoriNote-Android.zip
+__pycache__/
