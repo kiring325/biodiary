@@ -1,0 +1,16 @@
+name = "biodiary-api"
+main = "src/index.js"
+compatibility_date = "2026-10-07"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "biodiary-accounts"
+database_id = "15d7b1f5-d18d-4394-9247-011591d661e6"
+migrations_dir = "migrations"
+
+[vars]
+PI_ORIGIN = "https://raspberrypi.taildbbc1b.ts.net"
+ALLOWED_ORIGINS = "https://biodiary-album.pages.dev,https://*.biodiary-album.pages.dev"
+MAX_ACCOUNTS = "1000"
+MAX_COMMUNITY_MEMBERS = "60"
+LEGACY_LOGIN_ENABLED = "false"

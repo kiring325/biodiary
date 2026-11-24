@@ -1,0 +1,28 @@
+# Local credentials and machine-specific settings
+**/.env
+**/.env.*
+**/secrets.properties
+**/local.properties
+**/.wrangler/
+**/node_modules/.cache/wrangler/
+
+# Dependencies and generated build files
+**/node_modules/
+**/.gradle/
+**/.gradle-sandbox/
+**/.gradle-sandbox-home/
+**/build/
+**/.cache/
+
+# Local databases, logs, and signing keys
+**/*.sqlite
+**/*.sqlite3
+**/*.db
+**/*.log
+**/*.jks
+**/*.keystore
+
+# Old duplicate release artifacts at the outputs root.
+# Keep the current APK inside MoriNote-Web because the site links to it.
+/Biodiary-*.apk
+/MoriNote-Android.zip

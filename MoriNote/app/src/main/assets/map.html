@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <link rel="stylesheet" href="leaflet.css">
+  <style>
+    html, body, #map { width: 100%; height: 100%; margin: 0; background: #edf0e8; }
+    .leaflet-container { font-family: sans-serif; }
+    .leaflet-control-attribution { font-size: 10px !important; }
+    .photo-pin { width: 54px; height: 54px; border: 3px solid var(--season); border-radius: 14px 14px 14px 4px; background: white; padding: 3px; box-sizing: border-box; overflow: hidden; box-shadow: 0 2px 7px #0005; }
+    .photo-pin img { width: 100%; height: 100%; object-fit: cover; border-radius: 9px; }
+    .photo-pin.empty { display:flex; align-items:center; justify-content:center; color:#426b50; font-size:23px; }
+  </style>
+</head>
+<body>
+  <div id="map" aria-label="観察場所の地図"></div>
+  <script src="leaflet.js"></script>
+  <script>
+    const mapRoot = document.getElementById('map');
+    const showMapError = error => {
+      const message = document.createElement('div');
+      message.style.cssText = 'margin:12px;padding:12px;border-radius:10px;background:#fff;color:#7a2d2d;font:13px sans-serif;white-space:pre-wrap;';
+      message.textContent = '地図を初期化できませんでした。\n' + String(error);
+      mapRoot.replaceChildren(message);
+    };
+    try {
+      const map = L.map('map', { zoomControl: false }).setView([36.2, 138.25], 5.15);
+      L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap contributors</a>'
+      }).addTo(map);
+      L.control.zoom({ position: 'topright' }).addTo(map);
+      const pins = L.layerGroup().addTo(map);
+      map.on('click', event => MoriNote.onMapTap(event.latlng.lat, event.latlng.lng));
+      window.moriSetCenter = (lat, lng, zoom) => map.setView([lat, lng], zoom);
+      window.moriSetPins = records => {
+        pins.clearLayers();
+        records.forEach(pin => {
+          const contents = pin.photo
+            ? `<img src="${pin.photo}" alt="">`
+            : '<span aria-hidden="true">●</span>';
+          const icon = L.divIcon({
+            className: '',
+            html: `<div class="photo-pin${pin.photo ? '' : ' empty'}" style="--season:${pin.color}">${contents}</div>`,
+            iconSize: [54, 54],
+            iconAnchor: [27, 51]
+          });
+          L.marker([pin.lat, pin.lng], { icon }).addTo(pins)
+            .on('click', () => MoriNote.onPinTap(pin.id));
+        });
+      };
+      setTimeout(() => {
+        try { map.invalidateSize(); MoriNote.onMapReady(); }
+        catch (error) { showMapError(error); }
+      }, 250);
+    } catch (error) {
+      showMapError(error);
+    }
+  </script>
+</body>
+</html>
