@@ -22,8 +22,11 @@
 **/*.jks
 **/*.keystore
 
-# Old duplicate release artifacts at the outputs root.
-# Keep the current APK inside MoriNote-Web because the site links to it.
-/Biodiary-*.apk
-/MoriNote-Android.zip
+# 配布用の APK はリポジトリに含めない（公開サイトへの配置時に置く）
+**/*.apk
+**/*.zip
+
+# 環境ごとの接続先（URL）を書いたファイル。見本は *.example.* を参照
+Biodiary-Cloudflare/wrangler.toml
+Biodiary-Web/config.js
 __pycache__/
